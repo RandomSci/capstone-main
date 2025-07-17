@@ -15,12 +15,6 @@ import threading
 import gc
 import psutil
 
-if "SPACE_ID" in os.environ:
-    st.info("🤗 Running on Hugging Face Spaces!")
-    os.environ['HF_HOME'] = '/tmp/.huggingface'
-    os.environ['TORCH_HOME'] = '/tmp/.torch'
-    os.environ['ULTRALYTICS_HOME'] = '/tmp/.ultralytics'
-
 os.environ['STREAMLIT_SERVER_FILE_WATCHER_TYPE'] = 'none'
 os.environ['STREAMLIT_SERVER_ENABLE_STATIC_SERVING'] = 'false'
 os.environ['STREAMLIT_BROWSER_GATHER_USAGE_STATS'] = 'false'
@@ -37,6 +31,7 @@ YOLO_MODELS = {
     'YOLOv8n (Fastest)': 'yolov8n.pt',
     'YOLOv8s (Balanced)': 'yolov8s.pt',
     'YOLOv8m (Better Accuracy)': 'yolov8m.pt',
+    'YOLOv8l (High Accuracy)': 'yolov8l.pt',
 }
 
 def get_memory_usage():
@@ -45,60 +40,46 @@ def get_memory_usage():
 
 def cleanup_memory():
     gc.collect()
-    if len(mdl_cache) > 1:
+    if len(mdl_cache) > 2:
         oldest_key = next(iter(mdl_cache))
         del mdl_cache[oldest_key]
         gc.collect()
 
 @st.cache_resource
-def get_mdl(mdl_name: str = 'YOLOv8n (Fastest)'):
+def get_mdl(mdl_name: str = 'YOLOv8s (Balanced)'):
     global mdl_cache
     
     memory_mb = get_memory_usage()
-    if memory_mb > 12000:
+    if memory_mb > 6000:
         st.warning(f"⚠️ High memory usage: {memory_mb:.0f}MB. Cleaning up...")
         cleanup_memory()
     
     with mdl_lock:
-        mdl_path = YOLO_MODELS.get(mdl_name, 'yolov8n.pt')
+        mdl_path = YOLO_MODELS.get(mdl_name, 'yolov8s.pt')
         
         if mdl_name not in mdl_cache:
             try:
                 from ultralytics import YOLO
                 
-                if "SPACE_ID" in os.environ:
-                    st.info(f"🤗 Loading {mdl_name} on Hugging Face Spaces...")
-                else:
-                    st.info(f"Loading {mdl_name}... Please wait.")
+                st.info(f"🚂 Loading {mdl_name} on Railway...")
                 
                 if len(mdl_cache) >= 2:
                     cleanup_memory()
                 
                 mdl_cache[mdl_name] = YOLO(mdl_path)
                 
-                dummy_size = (320, 320, 3) if "SPACE_ID" in os.environ else (640, 640, 3)
-                dummy = np.zeros(dummy_size, dtype=np.uint8)
+                dummy = np.zeros((640, 640, 3), dtype=np.uint8)
                 mdl_cache[mdl_name].predict(dummy, verbose=False)
                 
                 memory_after = get_memory_usage()
                 st.success(f"✅ {mdl_name} loaded! Memory: {memory_after:.0f}MB")
                 
             except ImportError:
-                st.error("❌ ultralytics not found. Please check deployment configuration.")
+                st.error("❌ ultralytics not found. Installing...")
                 return None
             except Exception as e:
                 st.error(f"❌ Error loading {mdl_name}: {str(e)}")
-                
-                if "SPACE_ID" in os.environ and mdl_name != 'YOLOv8n (Fastest)':
-                    st.info("🤗 Trying lightweight model for HF Spaces...")
-                    try:
-                        mdl_cache[mdl_name] = YOLO('yolov8n.pt')
-                        st.success("✅ Fallback model loaded!")
-                    except:
-                        st.error("❌ Model loading failed completely.")
-                        return None
-                else:
-                    return None
+                return None
                     
     return mdl_cache.get(mdl_name)
 
@@ -124,38 +105,11 @@ st.markdown("""
         background-clip: text;
     }
     
-    .metric-card {
-        background: white;
-        padding: 1.5rem;
-        border-radius: 0.5rem;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-        border-left: 4px solid #1f77b4;
-    }
-    
-    .status-occupied { color: #d62728; }
-    .status-available { color: #2ca02c; }
-    
-    .sidebar-section {
-        padding: 1rem;
-        margin: 0.5rem 0;
-        border-radius: 0.5rem;
-        background-color: #f8f9fa;
-        border: 1px solid #e9ecef;
-    }
-    
-    .model-info {
-        background: #e3f2fd;
-        padding: 0.75rem;
-        border-radius: 0.5rem;
-        border-left: 3px solid #1976d2;
-        margin: 0.5rem 0;
-    }
-    
-    .hf-spaces-info {
-        background: #f0f8ff;
+    .railway-info {
+        background: #f8f9fa;
         padding: 1rem;
         border-radius: 0.5rem;
-        border: 1px solid #4dabf7;
+        border: 1px solid #6c757d;
         margin: 1rem 0;
     }
 </style>
@@ -169,39 +123,65 @@ class PSpace:
     
     def __post_init__(self):
         self.poly_arr = np.array(self.poly, dtype=np.int32)
+    
+    def scale_to_size(self, original_size: Tuple[int, int], target_size: Tuple[int, int]):
+        orig_w, orig_h = original_size
+        target_w, target_h = target_size
+        
+        scale_x = target_w / orig_w
+        scale_y = target_h / orig_h
+        
+        scaled_poly = []
+        for x, y in self.poly:
+            scaled_poly.append((x * scale_x, y * scale_y))
+        
+        scaled_lbl_pos = (int(self.lbl_pos[0] * scale_x), int(self.lbl_pos[1] * scale_y))
+        
+        return PSpace(
+            id=self.id,
+            poly=scaled_poly,
+            lbl_pos=scaled_lbl_pos
+        )
 
 class PDetector:
     def __init__(self, frm_sz: Tuple[int, int] = (1280, 720)):
         self.frm_sz = frm_sz
         self.spaces = []
-        self.mdl_name = 'YOLOv8n (Fastest)'
-        
-        self.OCC_CLR = (0, 0, 255)
-        self.AVL_CLR = (0, 255, 0)
-        self.DET_CLR = (255, 0, 0)
-        self.TXT_CLR = (255, 255, 255)
+        self.original_spaces = []
+        self.mdl_name = 'YOLOv8s (Balanced)'
         
         self.conf_th = 0.3
         self.iou_th = 0.5
-        self.sup_cls = ['car', 'truck', 'bus', 'motorcycle', 'bicycle']
         
-        self.det_sz_img = (640, 640) if "SPACE_ID" in os.environ else (1280, 1280)
-        self.det_sz_vid = (480, 480) if "SPACE_ID" in os.environ else (640, 640)
-        self.skip_frm = 5 if "SPACE_ID" in os.environ else 2
+        self.det_sz_img = (1280, 1280)
+        self.det_sz_vid = (800, 800)
+        self.skip_frm = 2 
         self.last_det = []
         
     def set_model(self, mdl_name: str):
         self.mdl_name = mdl_name
         
     def load_spaces(self, sp_data: List[Dict]) -> None:
-        self.spaces = []
+        self.original_spaces = []
         for sp in sp_data:
             space = PSpace(
                 id=sp['id'],
                 poly=sp['polygon'],
                 lbl_pos=tuple(sp['label_position'])
             )
-            self.spaces.append(space)
+            self.original_spaces.append(space)
+    
+    def scale_spaces_to_frame(self, frame_shape: Tuple[int, int]):
+        if not self.original_spaces:
+            return
+        
+        original_size = (1280, 720)
+        current_size = (frame_shape[1], frame_shape[0])
+        
+        self.spaces = []
+        for space in self.original_spaces:
+            scaled_space = space.scale_to_size(original_size, current_size)
+            self.spaces.append(scaled_space)
     
     def det_veh_simple(self, frm: np.ndarray, model=None) -> List[Tuple[int, int, int, int, str, float]]:
         if model is None:
@@ -212,14 +192,17 @@ class PDetector:
             m = model
         
         try:
-            if "SPACE_ID" in os.environ:
-                h, w = frm.shape[:2]
-                if max(h, w) > 640:
-                    scale = 640 / max(h, w)
-                    new_w, new_h = int(w * scale), int(h * scale)
-                    frm = cv2.resize(frm, (new_w, new_h))
+            detection_frame = frm.copy()
+            h, w = detection_frame.shape[:2]
+            scale_factor = 1.0
             
-            results = m.predict(frm, verbose=False, conf=self.conf_th)
+            if max(h, w) > 1920:
+                scale = 1920 / max(h, w)
+                new_w, new_h = int(w * scale), int(h * scale)
+                detection_frame = cv2.resize(detection_frame, (new_w, new_h))
+                scale_factor = 1 / scale
+            
+            results = m.predict(detection_frame, verbose=False, conf=self.conf_th)
             
             if not results or len(results[0].boxes) == 0:
                 return []
@@ -232,6 +215,11 @@ class PDetector:
                 conf = box.conf[0].cpu().numpy()
                 cls_id = int(box.cls[0].cpu().numpy())
                 cls_nm = m.names[cls_id]
+                
+                x1 *= scale_factor
+                y1 *= scale_factor
+                x2 *= scale_factor
+                y2 *= scale_factor
                 
                 x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
                 
@@ -308,68 +296,49 @@ class PDetector:
         return res_frm
     
     def proc_img(self, frm: np.ndarray) -> Tuple[np.ndarray, Dict[int, Dict]]:
-        if not self.spaces:
+        if not self.original_spaces:
             return frm, {}
         
-        rsz_frm = cv2.resize(frm, self.frm_sz)
-        dets = self.det_veh_simple(rsz_frm)
+        original_frame = frm.copy()
+        self.scale_spaces_to_frame(original_frame.shape)
+        
+        dets = self.det_veh_simple(original_frame)
         occ = self.chk_occ_simple(dets)
-        res_frm = self.draw_res_simple(rsz_frm, occ)
+        res_frm = self.draw_res_simple(original_frame, occ)
         
         return res_frm, occ
     
     def proc_vid_frm(self, frm: np.ndarray, frm_num: int = 0, model=None) -> Tuple[np.ndarray, Dict[int, Dict]]:
-        if not self.spaces:
+        if not self.original_spaces:
             return frm, {}
         
-        rsz_frm = cv2.resize(frm, self.frm_sz)
-        dets = self.det_veh_simple(rsz_frm, model)
+        self.scale_spaces_to_frame(frm.shape)
+        dets = self.det_veh_simple(frm, model)
         occ = self.chk_occ_simple(dets)
-        res_frm = self.draw_res_simple(rsz_frm, occ)
+        res_frm = self.draw_res_simple(frm, occ)
         
         return res_frm, occ
 
-def proc_vid_optimized(vid_path: str, det: PDetector, prog_bar, stat_txt) -> tuple:
+def proc_vid_railway(vid_path: str, det: PDetector, prog_bar, stat_txt) -> tuple:
     cap = cv2.VideoCapture(vid_path)
     
     fps = int(cap.get(cv2.CAP_PROP_FPS)) or 25
     tot_frms = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    w, h = det.frm_sz
     
-    if "SPACE_ID" in os.environ:
-        fps = min(fps, 15)
-        max_frames = min(tot_frms, 300)
-    else:
-        max_frames = tot_frms
+    orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    max_frames = tot_frms
+    w, h = orig_w, orig_h
     
     out_path = vid_path.replace('.mp4', '_processed.mp4')
     
-    # Load model once for entire video
     model = get_mdl(det.mdl_name)
     if model is None:
         raise RuntimeError("Failed to load YOLO model")
     
-    fourcc_opts = [
-        cv2.VideoWriter_fourcc(*'mp4v'),
-        cv2.VideoWriter_fourcc(*'XVID'),
-        cv2.VideoWriter_fourcc(*'MJPG'),
-        cv2.VideoWriter_fourcc(*'H264')
-    ]
-    
-    out = None
-    for fourcc in fourcc_opts:
-        try:
-            out = cv2.VideoWriter(out_path, fourcc, fps, (w, h))
-            test_frm = np.zeros((h, w, 3), dtype=np.uint8)
-            success = out.write(test_frm)
-            if success is not False:
-                break
-            out.release()
-        except:
-            continue
-    
-    if out is None:
-        raise RuntimeError("Could not initialize video writer")
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(out_path, fourcc, fps, (w, h))
     
     frm_cnt = 0
     processed_cnt = 0
@@ -384,7 +353,7 @@ def proc_vid_optimized(vid_path: str, det: PDetector, prog_bar, stat_txt) -> tup
             res_frm, occ = det.proc_vid_frm(frm, frm_cnt, model)
             processed_cnt += 1
             
-            if occ and processed_cnt % 5 == 0:
+            if occ and processed_cnt % 10 == 0:
                 occ_cnt = sum(1 for inf in occ.values() if inf['occupied'])
                 occ_data.append({
                     'frame': frm_cnt,
@@ -393,19 +362,15 @@ def proc_vid_optimized(vid_path: str, det: PDetector, prog_bar, stat_txt) -> tup
                     'available': len(occ) - occ_cnt
                 })
         else:
-            res_frm = cv2.resize(frm, det.frm_sz)
+            res_frm = frm
         
         out.write(res_frm)
         frm_cnt += 1
         
-        if frm_cnt % 10 == 0:
+        if frm_cnt % 30 == 0:
             prog = frm_cnt / max_frames
             prog_bar.progress(min(prog, 1.0))
             stat_txt.text(f"Processing frame {frm_cnt}/{max_frames} ({prog:.1%})")
-            
-            memory_mb = get_memory_usage()
-            if memory_mb > 14000:
-                cleanup_memory()
     
     cap.release()
     out.release()
@@ -436,33 +401,20 @@ class Editor:
     def render_ed(self, img_arr: np.ndarray = None) -> List[Dict]:
         st.subheader("🛠️ Parking Space Configuration")
         
-        with st.expander("📖 How to Configure", expanded=False):
+        with st.expander("📖 Instructions", expanded=False):
             st.markdown("""
-            **Configure your parking spaces:**
+            **Configure parking spaces:**
             
-            1. **JSON Format**: Edit the configuration below
-            2. **Polygon Points**: Define each space as coordinates [[x1,y1], [x2,y2], ...]
-            3. **Label Position**: Where to show the space number
-            4. **Preview**: Visual preview with your reference image
-            
-            **Example:**
-            ```json
-            {
-              "spaces": [
-                {
-                  "id": 1,
-                  "polygon": [[x1,y1], [x2,y2], [x3,y3], [x4,y4]],
-                  "label_position": [x, y]
-                }
-              ]
-            }
-            ```
+            1. Edit JSON configuration below
+            2. Define polygon coordinates for each space
+            3. Set label positions
+            4. Preview with reference image
             """)
         
         col1, col2 = st.columns([1, 1])
         
         with col1:
-            st.write("**📝 Configuration Editor**")
+            st.write("**📝 Configuration**")
             
             if 'park_cfg' not in st.session_state:
                 st.session_state.park_cfg = json.dumps(self.def_cfg, indent=2)
@@ -470,8 +422,7 @@ class Editor:
             cfg_txt = st.text_area(
                 "Edit parking configuration:",
                 value=st.session_state.park_cfg,
-                height=400,
-                help="Edit JSON configuration"
+                height=400
             )
             
             try:
@@ -493,19 +444,19 @@ class Editor:
                     if len(sp['polygon']) < 3:
                         raise ValueError(f"Space {sp['id']} needs 3+ points")
                 
-                st.success(f"✅ Valid config: {len(sps)} spaces")
+                st.success(f"✅ Valid: {len(sps)} spaces")
                 st.session_state.park_cfg = cfg_txt
                 
                 col_a, col_b = st.columns(2)
                 
                 with col_a:
-                    if st.button("🔄 Reset Default"):
+                    if st.button("🔄 Reset"):
                         st.session_state.park_cfg = json.dumps(self.def_cfg, indent=2)
                         st.rerun()
                 
                 with col_b:
                     st.download_button(
-                        label="📥 Download",
+                        "📥 Download",
                         data=cfg_txt,
                         file_name="parking_config.json",
                         mime="application/json"
@@ -517,7 +468,7 @@ class Editor:
                 st.error(f"❌ JSON Error: {str(e)}")
                 return []
             except ValueError as e:
-                st.error(f"❌ Config Error: {str(e)}")
+                st.error(f"❌ Error: {str(e)}")
                 return []
         
         with col2:
@@ -542,112 +493,18 @@ class Editor:
                     st.image(prev_rgb, use_container_width=True)
                     
                 except:
-                    st.error("Fix config errors for preview")
+                    st.error("Fix errors for preview")
             else:
-                st.info("Upload reference image for preview")
-
-def vid_tab():
-    st.header("🎬 Video Processing")
-    
-    if "SPACE_ID" in os.environ:
-        st.info("🤗 Video processing is optimized for max 300 frames, 15 FPS")
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        skip_frms = st.slider("Frame Skip (higher = faster)", 1, 10, 5 if "SPACE_ID" in os.environ else 2)
-        st.session_state.det.skip_frm = skip_frms
-    
-    with col2:
-        max_size = st.selectbox("Video Size Limit (MB)", [10, 25, 50, 100], index=1)
-    
-    up_vid = st.file_uploader("Upload video", type=['mp4', 'avi', 'mov'])
-    
-    if up_vid and st.session_state.det.spaces:
-        file_size = len(up_vid.getvalue()) / (1024*1024)
-        
-        if file_size > max_size:
-            st.error(f"Video size ({file_size:.1f}MB) exceeds limit ({max_size}MB)")
-            return
-        
-        if st.button("🚀 Process Video", type="primary"):
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_f:
-                tmp_f.write(up_vid.read())
-                vid_path = tmp_f.name
-            
-            try:
-                start_time = time.time()
-                
-                prog_bar = st.progress(0)
-                stat_txt = st.empty()
-                
-                out_path, occ_data = proc_vid_optimized(
-                    vid_path, st.session_state.det, prog_bar, stat_txt
-                )
-                
-                proc_time = time.time() - start_time
-                st.success(f"✅ Video processed in {proc_time:.1f}s!")
-                
-                if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        st.subheader("Processed Video")
-                        
-                        try:
-                            st.video(out_path)
-                        except Exception as e:
-                            st.error(f"Error displaying video: {e}")
-                        
-                        with open(out_path, 'rb') as f:
-                            st.download_button(
-                                "📥 Download Processed Video",
-                                data=f.read(),
-                                file_name="processed_parking_video.mp4",
-                                mime="video/mp4"
-                            )
-                    
-                    with col2:
-                        st.subheader("Occupancy Analysis")
-                        if occ_data:
-                            df = pd.DataFrame(occ_data)
-                            st.line_chart(df.set_index('timestamp')[['occupied', 'available']])
-                            
-                            avg_occ = df['occupied'].mean()
-                            max_occ = df['occupied'].max()
-                            min_occ = df['occupied'].min()
-                            
-                            st.write("**Video Statistics:**")
-                            st.metric("Average Occupied", f"{avg_occ:.1f}")
-                            st.metric("Peak Occupancy", f"{max_occ}")
-                            st.metric("Minimum Occupancy", f"{min_occ}")
-                        else:
-                            st.info("No occupancy data generated")
-                    
-                    if os.path.exists(out_path):
-                        os.unlink(out_path)
-                else:
-                    st.error("Failed to generate output video")
-                
-            except Exception as e:
-                st.error(f"Error processing video: {str(e)}")
-            finally:
-                if os.path.exists(vid_path):
-                    os.unlink(vid_path)
-    
-    elif up_vid:
-        st.warning("⚠️ Configure parking spaces first!")
+                st.info("Upload reference image")
 
 def main():
     st.markdown('<h1 class="main-header">🚗 Smart Parking Detection System</h1>', unsafe_allow_html=True)
     
-    if "SPACE_ID" in os.environ:
-        st.markdown("""
-        <div class="hf-spaces-info">
-            <h3>🤗 Welcome!</h3>
-            <p>This parking detection system supports both image and video processing, optimized for 16GB RAM. 
-            Features include real-time YOLO detection, configurable parking spaces, and comprehensive analytics.</p>
-        </div>
-        """, unsafe_allow_html=True)
+    st.markdown("""
+    <div class="railway-info">
+        <p>Optimized for better CPU performance.</p>
+    </div>
+    """, unsafe_allow_html=True)
     
     if 'det' not in st.session_state:
         st.session_state.det = PDetector()
@@ -659,33 +516,20 @@ def main():
         st.header("⚙️ Settings")
         
         memory_mb = get_memory_usage()
-        st.metric("Memory Usage", f"{memory_mb:.0f} MB")
+        st.metric("Memory", f"{memory_mb:.0f} MB")
         
-        if memory_mb > 10000:
-            st.warning("⚠️ High memory usage!")
-        
-        st.markdown('<div class="model-info">', unsafe_allow_html=True)
         st.write("**🧠 AI Model**")
         
         mdl_choice = st.selectbox(
             "YOLO Model:",
             list(YOLO_MODELS.keys()),
-            index=0,
-            help="YOLOv8n recommended for HF Spaces"
+            index=1,  
+            help="All models work well on Railway"
         )
         
         if mdl_choice != st.session_state.det.mdl_name:
             st.session_state.det.set_model(mdl_choice)
             st.info(f"Switched to {mdl_choice}")
-        
-        model_info = {
-            'YOLOv8n (Fastest)': '⚡ Best for HF Spaces',
-            'YOLOv8s (Balanced)': '⚖️ Good balance',
-            'YOLOv8m (Better Accuracy)': '🎯 Higher accuracy'
-        }
-        
-        st.info(model_info.get(mdl_choice, 'YOLO model'))
-        st.markdown('</div>', unsafe_allow_html=True)
         
         st.write("**🎛️ Detection**")
         
@@ -695,14 +539,7 @@ def main():
         iou_th = st.slider("IoU Threshold", 0.1, 0.9, 0.5, 0.05)
         st.session_state.det.iou_th = iou_th
         
-        st.write("**🎬 Video Settings**")
-        
-        if "SPACE_ID" in os.environ:
-            st.info("Video limited to 300 frames on HF Spaces")
-        else:
-            st.info("Full video processing available")
-        
-        st.write("**🤖 Model Management**")
+        st.write("**🤖 Management**")
         
         if st.button("🔄 Reload Model"):
             if mdl_choice in mdl_cache:
@@ -714,16 +551,12 @@ def main():
             cleanup_memory()
             st.success("Cache cleared!")
 
-    tab1, tab2, tab3, tab4 = st.tabs(["🔧 Setup", "📷 Image Detection", "🎬 Video Processing", "📊 Analytics"])
+    tab1, tab2, tab3, tab4 = st.tabs(["🔧 Setup", "📷 Images", "🎬 Videos", "📊 Analytics"])
     
     with tab1:
         st.header("🔧 Configuration")
         
-        ref_img = st.file_uploader(
-            "Upload reference image", 
-            type=['jpg', 'jpeg', 'png'],
-            help="Upload parking lot image to configure spaces"
-        )
+        ref_img = st.file_uploader("Upload reference image", type=['jpg', 'jpeg', 'png'])
         
         img_arr = None
         if ref_img:
@@ -736,22 +569,18 @@ def main():
         
         if sps:
             st.session_state.det.load_spaces(sps)
-            st.success(f"✅ Loaded {len(sps)} parking spaces")
+            st.success(f"✅ Loaded {len(sps)} spaces")
     
     with tab2:
         st.header("📷 Image Detection")
         
-        col_info1, col_info2 = st.columns(2)
-        with col_info1:
-            st.info(f"🧠 Model: **{st.session_state.det.mdl_name}**")
-        with col_info2:
-            st.info(f"📊 Memory: **{get_memory_usage():.0f}MB**")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.info(f"Model: **{st.session_state.det.mdl_name}**")
+        with col2:
+            st.info(f"Memory: **{get_memory_usage():.0f}MB**")
         
-        up_img = st.file_uploader(
-            "Upload image for detection", 
-            type=['jpg', 'jpeg', 'png'], 
-            key="img_up"
-        )
+        up_img = st.file_uploader("Upload image", type=['jpg', 'jpeg', 'png'], key="img_up")
         
         if up_img:
             img = Image.open(up_img)
@@ -768,8 +597,8 @@ def main():
             with col2:
                 st.subheader("Detection Results")
                 
-                if st.session_state.det.spaces:
-                    with st.spinner(f"Processing with {st.session_state.det.mdl_name}..."):
+                if st.session_state.det.original_spaces:
+                    with st.spinner("Processing..."):
                         start_time = time.time()
                         res_frm, occ = st.session_state.det.proc_img(img_arr)
                         proc_time = time.time() - start_time
@@ -777,7 +606,7 @@ def main():
                         res_rgb = cv2.cvtColor(res_frm, cv2.COLOR_BGR2RGB)
                         st.image(res_rgb, use_container_width=True)
                         
-                        st.caption(f"⏱️ Processed in {proc_time:.2f}s")
+                        st.caption(f"⏱️ {proc_time:.2f}s")
                         
                         if occ:
                             occ_cnt = sum(1 for inf in occ.values() if inf['occupied'])
@@ -795,56 +624,127 @@ def main():
                             with col_d:
                                 st.metric("Rate", f"{occ_rate:.1f}%")
                             
-                            st.subheader("Space Details")
+                            st.subheader("Details")
                             for sp_id, inf in occ.items():
                                 if inf['occupied'] and inf['vehicle']:
                                     veh = inf['vehicle']
-                                    st.write(f"🔴 **Space {sp_id}**: {veh['class'].title()} "
-                                           f"({veh['confidence']:.2f})")
+                                    st.write(f"🔴 **Space {sp_id}**: {veh['class'].title()} ({veh['confidence']:.2f})")
                                 else:
                                     st.write(f"🟢 **Space {sp_id}**: Available")
-                        else:
-                            st.info("No detection results")
                 else:
-                    st.warning("⚠️ Configure parking spaces first in Setup tab!")
+                    st.warning("⚠️ Configure spaces first!")
     
     with tab3:
-        vid_tab()
+        st.header("🎬 Video Processing")
+        
+        st.info("🚂 Full video processing available on Railway!")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            skip_frms = st.slider("Frame Skip", 1, 10, 2)
+            st.session_state.det.skip_frm = skip_frms
+        
+        with col2:
+            max_size = st.selectbox("Max Video Size (MB)", [50, 100, 200, 500], index=2)
+        
+        up_vid = st.file_uploader("Upload video", type=['mp4', 'avi', 'mov'])
+        
+        if up_vid and st.session_state.det.original_spaces:
+            file_size = len(up_vid.getvalue()) / (1024*1024)
+            
+            if file_size > max_size:
+                st.error(f"Video too large: {file_size:.1f}MB > {max_size}MB")
+                return
+            
+            if st.button("🚀 Process Video", type="primary"):
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_f:
+                    tmp_f.write(up_vid.read())
+                    vid_path = tmp_f.name
+                
+                try:
+                    start_time = time.time()
+                    
+                    prog_bar = st.progress(0)
+                    stat_txt = st.empty()
+                    
+                    out_path, occ_data = proc_vid_railway(
+                        vid_path, st.session_state.det, prog_bar, stat_txt
+                    )
+                    
+                    proc_time = time.time() - start_time
+                    st.success(f"✅ Processed in {proc_time:.1f}s!")
+                    
+                    if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                        col1, col2 = st.columns(2)
+                        
+                        with col1:
+                            st.subheader("Processed Video")
+                            st.video(out_path)
+                            
+                            with open(out_path, 'rb') as f:
+                                st.download_button(
+                                    "📥 Download",
+                                    data=f.read(),
+                                    file_name="processed_video.mp4",
+                                    mime="video/mp4"
+                                )
+                        
+                        with col2:
+                            st.subheader("Analysis")
+                            if occ_data:
+                                df = pd.DataFrame(occ_data)
+                                st.line_chart(df.set_index('timestamp')[['occupied', 'available']])
+                                
+                                st.metric("Avg Occupied", f"{df['occupied'].mean():.1f}")
+                                st.metric("Peak", f"{df['occupied'].max()}")
+                                st.metric("Min", f"{df['occupied'].min()}")
+                        
+                        os.unlink(out_path)
+                    else:
+                        st.error("Failed to process video")
+                    
+                except Exception as e:
+                    st.error(f"Error: {str(e)}")
+                finally:
+                    if os.path.exists(vid_path):
+                        os.unlink(vid_path)
+        
+        elif up_vid:
+            st.warning("⚠️ Configure spaces first!")
     
     with tab4:
         st.header("📊 Analytics")
         
-        if st.session_state.det.spaces:
+        if st.session_state.det.original_spaces:
             col1, col2 = st.columns(2)
             
             with col1:
-                st.subheader("Model Performance")
+                st.subheader("Performance")
                 
                 perf_data = {
-                    'Model': ['YOLOv8n', 'YOLOv8s', 'YOLOv8m'],
-                    'Speed (FPS)': [150, 120, 80],
-                    'Accuracy': [37.3, 44.9, 50.2],
-                    'Size (MB)': [6.2, 21.5, 49.7]
+                    'Model': ['YOLOv8n', 'YOLOv8s', 'YOLOv8m', 'YOLOv8l'],
+                    'Speed': ['Fastest', 'Fast', 'Medium', 'Slow'],
+                    'Accuracy': ['Good', 'Better', 'Best', 'Excellent'],
+                    'Railway': ['✅', '✅', '✅', '⚠️']
                 }
                 
                 df = pd.DataFrame(perf_data)
                 st.dataframe(df, use_container_width=True)
             
             with col2:
-                st.subheader("System Status")
+                st.subheader("System Info")
                 
-                system_info = {
-                    "Platform": "Hugging Face Spaces" if "SPACE_ID" in os.environ else "Local",
+                info = {
+                    "Platform": "Railway",
                     "Model": st.session_state.det.mdl_name,
                     "Confidence": st.session_state.det.conf_th,
-                    "IoU Threshold": st.session_state.det.iou_th,
-                    "Memory Usage": f"{get_memory_usage():.0f}MB",
-                    "Video Skip Frames": st.session_state.det.skip_frm
+                    "Memory": f"{get_memory_usage():.0f}MB",
+                    "Video Processing": "Full Quality"
                 }
                 
-                st.json(system_info)
+                st.json(info)
             
-            st.subheader("Sample Analytics")
+            st.subheader("Sample Data")
             
             hours = list(range(24))
             occupancy = np.random.uniform(0.2, 0.9, 24)
@@ -854,7 +754,6 @@ def main():
                 'Occupancy': occupancy
             })
             
-            st.write("**Hourly Occupancy Pattern**")
             st.line_chart(df_hourly.set_index('Hour'))
             
             col_a, col_b, col_c = st.columns(3)
@@ -863,17 +762,10 @@ def main():
             with col_b:
                 st.metric("Average", f"{occupancy.mean():.1%}")
             with col_c:
-                st.metric("Minimum", f"{occupancy.min():.1%}")
-            
-            st.subheader("Video Processing Stats")
-            
-            if "SPACE_ID" in os.environ:
-                st.info("🤗 HF Spaces: Max 300 frames, 15 FPS, optimized processing")
-            else:
-                st.info("💻 Local: Full video processing, all frames")
+                st.metric("Min", f"{occupancy.min():.1%}")
                 
         else:
-            st.warning("Configure parking spaces first!")
+            st.warning("Configure spaces first!")
     
     st.markdown("---")
     st.markdown("""
