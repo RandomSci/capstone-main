@@ -57,10 +57,4 @@ A real-time parking space detection system powered by YOLO models, optimized for
 3. Run: `streamlit run app.py`
 4. Access at `http://localhost:8501`
 
-## Deployment
-
-This app is optimized for Hugging Face Spaces deployment with automatic model caching and memory management.
-
----
-
 Built with ❤️ for the AI community
